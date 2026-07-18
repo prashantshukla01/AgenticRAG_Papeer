@@ -75,3 +75,36 @@ def router_node(state: RAGState) -> dict:
     decision : RouterDecision = router_chain.invoke({"query": query})
     return {"route": decision.route}
 
+
+# ── Tool schemas ──────────────────────────────────────────────────────────────
+
+class RetrieverInput(BaseModel):
+    query: str = Field(..., description = "Semantic query to search research paper chunks")
+    k: int = Field(default = 4 , ge = 1 , le = 10 , description="Number of chunks to retrieve"  )
+
+
+class WebSearchInput(BaseModel):
+    optimised_query: str = Field(description = "Query rewritten and optimized for web search")
+    max_results: int = Field(default = 3 , ge = 1 , le = 10, description = "Maximum number of web search results to return")
+    
+    
+
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
+@tool(args_schema = RetrieverInput)
+def retrieve_from_vectorstore(
+    query: str,
+    k: int,
+    session_id: Annotated[str, InjectedState("session_id")],
+    current_docs: Annotated[list, InjectedState("retrieved_docs")],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> list:
+    """Search the uploaded research paper vector store for relevant passages."""
+    docs = vs_search(query=query, session_id=session_id, k=k)
+    if not docs:
+        return [ToolMessage(content="No relevant documents found in the vector store.", tool_call_id=tool_call_id)]
+    summary = f"Retrieved {len(docs)} chunk(s) from the vector store."
+    return [
+        ToolMessage(content=summary, tool_call_id=tool_call_id),
+        Command(update={"retrieved_docs": (current_docs or []) + docs}),
+    ]
