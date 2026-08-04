@@ -108,3 +108,30 @@ def retrieve_from_vectorstore(
         ToolMessage(content=summary, tool_call_id=tool_call_id),
         Command(update={"retrieved_docs": (current_docs or []) + docs}),
     ]
+    
+    
+@tool(args_schema= WebSearchInput)
+def web_search(
+    optimised_query: str,
+    max_results: int,
+    current_docs : Annotated[list , InjectedState("retrieved_docs")],
+    tool_call_id:Annotated[str , InjectedToolCallId],
+    
+)->list:
+    """Search the web for current or supplementary information using Tavily."""
+    client= TavilyClient(api_key = os.environ.get("TAVILY_API_KEY"))
+    results = client.search(optimised_query , max_results = max_results)
+    if not results.get("results"):
+        return [ToolMessage(content = "No relevant web search results found.", tool_call_id = tool_call_id)]
+    
+    web_docs = [Document(
+        page_content = r["content"],
+        metadata={"url": r["url"], "title": r.get("title", "Web Result")},
+    ) for r in results["results"]]
+    
+    summary = f"Retrieved {len(web_docs)} web result(s) for: {optimised_query}"
+    
+    return [
+        ToolMessage(content=summary, tool_call_id=tool_call_id),
+        Command(update={"retrieved_docs": (current_docs or []) + web_docs}),
+    ]
