@@ -28,7 +28,7 @@ load_dotenv()
 
 llm = ChatOpenAI(model = "gpt-5.4-mini")
 
-class RAGState(MessageState):
+class RAGState(MessagesState):
     session_id: str
     query : str
     route: str | None
@@ -239,5 +239,199 @@ def query_rewrite_node(state: RAGState) -> dict:
     }
     
     
+CLAIM_ANALYSIS_PROMPT = (
+    "You are a research fact-checker. Given a claim from a research paper and "
+    "a set of recent web and arXiv search results, determine:\n"
+    "1. Has this claim been superseded, significantly challenged, or updated by more recent work?\n"
+    "2. Identify up to 3 papers from the provided results that supersede or update the claim.\n\n"
+    "Rules:\n"
+    "- Use ONLY titles and URLs that appear verbatim in the provided search results.\n"
+    "- Prefer arXiv paper links (arxiv.org) over general web links when available.\n"
+    "- For each superseding paper, write one sentence explaining how it supersedes the claim.\n"
+    "- If the claim still holds, set is_superseded=false and return an empty superseding_papers list.\n"
+    "- verdict_summary should be 1-2 sentences suitable for display to the user."
+)
 
+verification_llm = llm.with_structured_output(ClaimVerificationResult)
+
+def verify_claim_node(state: RAGState) -> dict:
+    claim = state["messages"][-1].content
+    tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+
+    # General web search for recent work superseding the claim
+    general_results = tavily_client.search(
+        f"recent research superseding: {claim[:200]}",
+        max_results=5,
+    ).get("results", [])
+
+    # arXiv-targeted search via web to get paper titles and links
+    arxiv_results = tavily_client.search(
+        f"site:arxiv.org {claim[:200]}",
+        max_results=5,
+    ).get("results", [])
+
+    # Build context block
+    lines = ["=== General Web Search Results ==="]
+    for r in general_results:
+        lines.append(
+            f"Title: {r.get('title', '')}\n"
+            f"URL: {r['url']}\n"
+            f"Snippet: {r.get('content', '')[:300]}\n"
+        )
+
+    lines.append("=== arXiv Paper Search Results ===")
+    for r in arxiv_results:
+        lines.append(
+            f"Title: {r.get('title', '')}\n"
+            f"URL: {r['url']}\n"
+            f"Snippet: {r.get('content', '')[:300]}\n"
+        )
+
+    context = "\n".join(lines)
+
+    prompt = (
+        f"{CLAIM_ANALYSIS_PROMPT}\n\n"
+        f"Claim to verify:\n{claim}\n\n"
+        f"Search Results:\n{context}"
+    )
+    result: ClaimVerificationResult = verification_llm.invoke([
+        {"role": "user", "content": prompt}
+    ])
+
+    papers_dicts = [p.model_dump() for p in result.superseding_papers[:3]]
+    return {
+        "claim_verdict": result.verdict_summary,
+        "claim_source": papers_dicts[0]["url"] if papers_dicts else None,
+        "superseding_papers": papers_dicts,
+    }
+
+def generate_answer_node(state: RAGState) -> dict:
+    route = state.get("route")
+    query = state["query"]
+
+    if route == "retrieve":
+        if state.get("is_relevant") is False and state.get("rewrite_count", 0) >= 1:
+            answer = (
+                "I wasn't able to find relevant information in the uploaded papers "
+                "to answer your question. You may want to rephrase your question "
+                "or upload additional papers."
+            )
+        else:
+            docs = state.get("retrieved_docs") or []
+            if not docs:
+                answer = "I don't know the answer."
+            else:
+                context = "\n\n---\n\n".join(doc.page_content for doc in docs)
+                prompt = f"Answer the question using this context:\n\n{context}\n\nQuestion: {query}"
+                answer = llm.invoke([{"role": "user", "content": prompt}]).content
+
+    elif route == "verify_claim":
+        verdict = state.get("claim_verdict", "")
+        papers = state.get("superseding_papers") or []
+        claim_text = state["query"]
+        if papers:
+            papers_block = "\n\n".join(
+                f"{i + 1}. **{p['title']}**\n   {p['summary']}\n   Link: {p['url']}"
+                for i, p in enumerate(papers)
+            )
+            answer = (
+                f"**Claim Verification Result**\n\n"
+                f"> {claim_text}\n\n"
+                f"**Verdict:** {verdict}\n\n"
+                f"**Superseding Papers:**\n\n{papers_block}\n\n"
+                f"---\n"
+                f"*You can load any of these papers into your knowledge base "
+                f"to continue your research with the latest findings.*"
+            )
+        else:
+            answer = (
+                f"**Claim Verification Result**\n\n"
+                f"> {claim_text}\n\n"
+                f"**Verdict:** {verdict}\n\n"
+                f"*No papers directly superseding this claim were found in recent literature.*"
+            )
+
+    else:  # direct_answer
+        prompt = f"Answer from your knowledge.\n\nQuestion: {query}"
+        answer = llm.invoke([{"role": "user", "content": prompt}]).content
+
+    return {"answer": answer, "messages": [AIMessage(content=answer)]}
+
+
+
+# ── Graph ─────────────────────────────────────────────────────────────────────
+
+MAX_RETRIEVAL_ATTEMPTS = 3
+
+def route_query(state: RAGState) -> str:
+    return state["route"]
+
+
+def agent_routing(state: RAGState) -> str:
+    # Always execute pending tool calls first — shortcutting here would leave
+    # an AIMessage with tool_calls unmatched by ToolMessages in the checkpointer,
+    # corrupting history for all future turns in the same session.
+    tc = tools_condition(state)
+    if tc == "tools":
+        return "retrieval"
+    if state.get("retrieval_attempts", 0) >= MAX_RETRIEVAL_ATTEMPTS:
+        return "generate_answer"
+    return "relevancy_check"
+
+
+def after_relevancy_routing(state: RAGState) -> str:
+    if state.get("is_relevant", False):
+        return "generate_answer"
+    if state.get("rewrite_count", 0) < 1:
+        return "query_rewrite"
+    return "generate_answer"
+
+
+def build_graph(db_path: str = "checkpoints.db"):
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    checkpointer = SqliteSaver(conn)
+
+    graph = StateGraph(RAGState)
+    graph.add_node("router", router_node)
+    graph.add_node("agent_node", agent_node)
+    graph.add_node("retrieval", base_tool_node)
+    graph.add_node("relevancy_check", relevancy_check_node)
+    graph.add_node("query_rewrite", query_rewrite_node)
+    graph.add_node("verify_claim", verify_claim_node)
+    graph.add_node("generate_answer", generate_answer_node)
+
+    graph.set_entry_point("router")
+
+    graph.add_conditional_edges(
+        "router",
+        route_query,
+        {
+            "retrieve": "agent_node",
+            "verify_claim": "verify_claim",
+            "direct_answer": "generate_answer",
+        },
+    )
+
+    graph.add_conditional_edges(
+        "agent_node",
+        agent_routing,
+        {
+            "retrieval": "retrieval",
+            "relevancy_check": "relevancy_check",
+            "generate_answer": "generate_answer",
+        },
+    )
+    graph.add_edge("retrieval", "agent_node")
+
+    graph.add_conditional_edges(
+        "relevancy_check",
+        after_relevancy_routing,
+        {"query_rewrite": "query_rewrite", "generate_answer": "generate_answer"},
+    )
+    graph.add_edge("query_rewrite", "agent_node")
+
+    graph.add_edge("verify_claim", "generate_answer")
+    graph.add_edge("generate_answer", END)
+
+    return graph.compile(checkpointer=checkpointer)
 
