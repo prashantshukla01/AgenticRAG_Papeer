@@ -1,52 +1,57 @@
-import os 
+import os
 import sqlite3
 import warnings
 from typing import Annotated
 
-from oauthlib.uri_validate import query
-
-warnings.filterwarnings("ignore", message = "The default value of `allowed_objects`")
+warnings.filterwarnings("ignore", message="The default value of `allowed_objects`")
 
 from dotenv import load_dotenv
 from langchain_core.documents import Document
-from langchain_core.messages import  AIMessage , ToolMessage , HumanMessage
-from langchain_core.prompts import ChatPromptTemplate 
-from langchain_core.tools import tool , InjectedToolCallId
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.tools import InjectedToolCallId, tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.graph import END, MessagesState , StateGraph
-from langgraph.prebuilt import InjectedState , tools_condition , ToolNode
+from langgraph.graph import END, MessagesState, StateGraph
+from langgraph.prebuilt import InjectedState, ToolNode, tools_condition
 from langgraph.types import Command
-from pydantic import BaseModel , Field
+from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
-
-from backend.models import ClaimVerificationResult , RelevancyDecision , RouterDecision
+from backend.config import get_llm_model
+from backend.models import ClaimVerificationResult, RelevancyDecision, RouterDecision
 from backend.vector_store import search as vs_search
 
 load_dotenv()
 
-llm = ChatOpenAI(model = "gpt-5.4-mini")
+
+def get_llm(model_name: str | None = None) -> ChatOpenAI:
+    """Return a ChatOpenAI instance using the specified or configured model."""
+    selected_model = model_name or get_llm_model()
+    return ChatOpenAI(
+        model=selected_model,
+        api_key=os.environ.get("OPENAI_API_KEY"),
+    )
+
 
 class RAGState(MessagesState):
     session_id: str
-    query : str
+    query: str
     route: str | None
-    retrieved_docs = list[Document]
-    retrieval_attempts : int
-    claim_verdict : str | None
-    claim_source : str | None
+    retrieved_docs: list[Document]
+    retrieval_attempts: int
+    claim_verdict: str | None
+    claim_source: str | None
     superseding_papers: list[dict] | None
-    answer : str | None
+    answer: str | None
     is_relevant: bool | None
-    rewrite_query : str| None
-    
-    
-    
-    
+    rewrite_query: str | None
+    rewrite_count: int | None
+
+
 ROUTER_PROMPT = ChatPromptTemplate.from_messages([
     (
-    "system",
+        "system",
         "You are a routing assistant for a research paper Q&A system. "
         "Classify the user query into exactly one of three categories:\n\n"
         "  retrieve — Use this for TWO types of questions:\n"
@@ -65,33 +70,33 @@ ROUTER_PROMPT = ChatPromptTemplate.from_messages([
         "When in doubt between retrieve and direct_answer, prefer retrieve.\n\n"
         "Return only the route field.",
     ),
-    ("human" , "{query}"),
+    ("human", "{query}"),
 ])
 
-router_chain = ROUTER_PROMPT| llm.with_structured_output(RouterDecision)
 
 def router_node(state: RAGState) -> dict:
-    dict = state["messages"][-1].content
-    decision : RouterDecision = router_chain.invoke({"query": query})
+    user_query = state.get("query") or state["messages"][-1].content
+    llm = get_llm()
+    router_chain = ROUTER_PROMPT | llm.with_structured_output(RouterDecision)
+    decision: RouterDecision = router_chain.invoke({"query": user_query})
     return {"route": decision.route}
 
 
 # ── Tool schemas ──────────────────────────────────────────────────────────────
 
 class RetrieverInput(BaseModel):
-    query: str = Field(..., description = "Semantic query to search research paper chunks")
-    k: int = Field(default = 4 , ge = 1 , le = 10 , description="Number of chunks to retrieve"  )
+    query: str = Field(..., description="Semantic query to search research paper chunks")
+    k: int = Field(default=4, ge=1, le=10, description="Number of chunks to retrieve")
 
 
 class WebSearchInput(BaseModel):
-    optimised_query: str = Field(description = "Query rewritten and optimized for web search")
-    max_results: int = Field(default = 3 , ge = 1 , le = 10, description = "Maximum number of web search results to return")
-    
-    
+    optimised_query: str = Field(description="Query rewritten and optimized for web search")
+    max_results: int = Field(default=3, ge=1, le=10, description="Maximum number of web search results to return")
 
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
-@tool(args_schema = RetrieverInput)
+
+@tool(args_schema=RetrieverInput)
 def retrieve_from_vectorstore(
     query: str,
     k: int,
@@ -108,40 +113,42 @@ def retrieve_from_vectorstore(
         ToolMessage(content=summary, tool_call_id=tool_call_id),
         Command(update={"retrieved_docs": (current_docs or []) + docs}),
     ]
-    
-    
-@tool(args_schema= WebSearchInput)
+
+
+@tool(args_schema=WebSearchInput)
 def web_search(
     optimised_query: str,
     max_results: int,
-    current_docs : Annotated[list , InjectedState("retrieved_docs")],
-    tool_call_id:Annotated[str , InjectedToolCallId],
-    
-)->list:
+    current_docs: Annotated[list, InjectedState("retrieved_docs")],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> list:
     """Search the web for current or supplementary information using Tavily."""
-    client= TavilyClient(api_key = os.environ.get("TAVILY_API_KEY"))
-    results = client.search(optimised_query , max_results = max_results)
+    tavily_key = os.environ.get("TAVILY_API_KEY")
+    if not tavily_key:
+        return [ToolMessage(content="Tavily API Key is not configured.", tool_call_id=tool_call_id)]
+
+    client = TavilyClient(api_key=tavily_key)
+    results = client.search(optimised_query, max_results=max_results)
     if not results.get("results"):
-        return [ToolMessage(content = "No relevant web search results found.", tool_call_id = tool_call_id)]
-    
-    web_docs = [Document(
-        page_content = r["content"],
-        metadata={"url": r["url"], "title": r.get("title", "Web Result")},
-    ) for r in results["results"]]
-    
+        return [ToolMessage(content="No relevant web search results found.", tool_call_id=tool_call_id)]
+
+    web_docs = [
+        Document(
+            page_content=r["content"],
+            metadata={"url": r["url"], "title": r.get("title", "Web Result")},
+        )
+        for r in results["results"]
+    ]
+
     summary = f"Retrieved {len(web_docs)} web result(s) for: {optimised_query}"
-    
     return [
         ToolMessage(content=summary, tool_call_id=tool_call_id),
         Command(update={"retrieved_docs": (current_docs or []) + web_docs}),
     ]
 
-# ── Retrieval agent singletons ────────────────────────────────────────────────
 
-RETRIEVAL_TOOLS = [retrieve_from_vectorstore , web_search]
-retrieval_llm = llm.bind_tools(RETRIEVAL_TOOLS , parallel_tool_calls = False)
+RETRIEVAL_TOOLS = [retrieve_from_vectorstore, web_search]
 base_tool_node = ToolNode(RETRIEVAL_TOOLS)
-
 
 RETRIEVE_SYSTEM = (
     "You are a research assistant gathering context to answer a user's question about research papers.\n\n"
@@ -161,8 +168,6 @@ RETRIEVE_SYSTEM = (
     "Do NOT produce a final answer. Only call tools to collect context."
 )
 
-# ── Relevancy check ───────────────────────────────────────────────────────────
-
 RELEVANCY_CHECK_SYSTEM = (
     "You are evaluating whether retrieved document chunks are relevant enough "
     "to answer a user's question about research papers.\n\n"
@@ -171,8 +176,6 @@ RELEVANCY_CHECK_SYSTEM = (
     "Return is_relevant=false only if the chunks are clearly off-topic or contain "
     "no useful information.\n\nBe lenient: if there is any substantive overlap, return true."
 )
-
-relevancy_llm = llm.with_structured_output(RelevancyDecision)
 
 QUERY_REWRITE_SYSTEM = (
     "You are a query rewriting assistant for a research paper retrieval system. "
@@ -185,14 +188,17 @@ QUERY_REWRITE_SYSTEM = (
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 
+MAX_RETRIEVAL_ATTEMPTS = 3
+
+
 def agent_node(state: RAGState) -> dict:
-    current_attempts = state.get("retrieval_attempts",0)
-    # Once at the cap, use plain LLM so the agent cannot emit more tool calls.
-    # This prevents orphaned tool_call IDs from entering the persisted message history.
-    # retrieval llm --> tool call --> tool result
-    # llm --> no tools are bounded --> tool call
-    
-    lm = llm if current_attempts >= MAX_RETRIEVAL_ATTEMPTS else retrieval_llm
+    current_attempts = state.get("retrieval_attempts", 0)
+    llm = get_llm()
+    if current_attempts >= MAX_RETRIEVAL_ATTEMPTS:
+        lm = llm
+    else:
+        lm = llm.bind_tools(RETRIEVAL_TOOLS, parallel_tool_calls=False)
+
     messages = state["messages"] + [{"role": "system", "content": RETRIEVE_SYSTEM}]
     response = lm.invoke({"messages": messages})
     updates: dict = {"messages": [response]}
@@ -207,23 +213,25 @@ def relevancy_check_node(state: RAGState) -> dict:
     doc_snippets = "\n\n---\n\n".join(doc.page_content[:300] for doc in docs[:3])
     if not doc_snippets:
         return {"is_relevant": False}
-    
+
     prompt = (
         f"Question: {query}\n\nRetrieved chunks:\n{doc_snippets}\n\n"
         "Are these chunks relevant to answering the question?"
     )
-    
+
+    relevancy_llm = get_llm().with_structured_output(RelevancyDecision)
     decision: RelevancyDecision = relevancy_llm.invoke([
         {"role": "system", "content": RELEVANCY_CHECK_SYSTEM},
         {"role": "user", "content": prompt},
     ])
-    
+
     return {"is_relevant": decision.is_relevant}
 
 
 def query_rewrite_node(state: RAGState) -> dict:
     original_query = state["query"]
     rewrite_count = state.get("rewrite_count", 0)
+    llm = get_llm()
     response = llm.invoke([
         {"role": "system", "content": QUERY_REWRITE_SYSTEM},
         {"role": "user", "content": f"Original query: {original_query}\n\nWrite an improved search query."},
@@ -237,8 +245,8 @@ def query_rewrite_node(state: RAGState) -> dict:
         "rewrite_count": rewrite_count + 1,
         "is_relevant": None,
     }
-    
-    
+
+
 CLAIM_ANALYSIS_PROMPT = (
     "You are a research fact-checker. Given a claim from a research paper and "
     "a set of recent web and arXiv search results, determine:\n"
@@ -252,11 +260,18 @@ CLAIM_ANALYSIS_PROMPT = (
     "- verdict_summary should be 1-2 sentences suitable for display to the user."
 )
 
-verification_llm = llm.with_structured_output(ClaimVerificationResult)
 
 def verify_claim_node(state: RAGState) -> dict:
     claim = state["messages"][-1].content
-    tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+    tavily_key = os.environ.get("TAVILY_API_KEY")
+    if not tavily_key:
+        return {
+            "claim_verdict": "Tavily API Key is not configured for claim verification.",
+            "claim_source": None,
+            "superseding_papers": [],
+        }
+
+    tavily_client = TavilyClient(api_key=tavily_key)
 
     # General web search for recent work superseding the claim
     general_results = tavily_client.search(
@@ -270,7 +285,6 @@ def verify_claim_node(state: RAGState) -> dict:
         max_results=5,
     ).get("results", [])
 
-    # Build context block
     lines = ["=== General Web Search Results ==="]
     for r in general_results:
         lines.append(
@@ -294,6 +308,8 @@ def verify_claim_node(state: RAGState) -> dict:
         f"Claim to verify:\n{claim}\n\n"
         f"Search Results:\n{context}"
     )
+
+    verification_llm = get_llm().with_structured_output(ClaimVerificationResult)
     result: ClaimVerificationResult = verification_llm.invoke([
         {"role": "user", "content": prompt}
     ])
@@ -305,12 +321,14 @@ def verify_claim_node(state: RAGState) -> dict:
         "superseding_papers": papers_dicts,
     }
 
+
 def generate_answer_node(state: RAGState) -> dict:
     route = state.get("route")
     query = state["query"]
+    llm = get_llm()
 
     if route == "retrieve":
-        if state.get("is_relevant") is False and state.get("rewrite_count", 0) >= 1:
+        if state.get("is_relevant") is False and state.get("rewrite_count", 0) >= 3:
             answer = (
                 "I wasn't able to find relevant information in the uploaded papers "
                 "to answer your question. You may want to rephrase your question "
@@ -319,10 +337,14 @@ def generate_answer_node(state: RAGState) -> dict:
         else:
             docs = state.get("retrieved_docs") or []
             if not docs:
-                answer = "I don't know the answer."
+                answer = "I don't know the answer based on the current context."
             else:
                 context = "\n\n---\n\n".join(doc.page_content for doc in docs)
-                prompt = f"Answer the question using this context:\n\n{context}\n\nQuestion: {query}"
+                prompt = (
+                    f"You are an academic research assistant. Answer the question using this context:\n\n"
+                    f"{context}\n\nQuestion: {query}\n\n"
+                    "Provide a thorough, precise, and well-structured answer with references to paper sections or sources when available."
+                )
                 answer = llm.invoke([{"role": "user", "content": prompt}]).content
 
     elif route == "verify_claim":
@@ -352,25 +374,19 @@ def generate_answer_node(state: RAGState) -> dict:
             )
 
     else:  # direct_answer
-        prompt = f"Answer from your knowledge.\n\nQuestion: {query}"
+        prompt = f"You are a helpful research assistant. Answer from your knowledge.\n\nQuestion: {query}"
         answer = llm.invoke([{"role": "user", "content": prompt}]).content
 
     return {"answer": answer, "messages": [AIMessage(content=answer)]}
 
 
-
 # ── Graph ─────────────────────────────────────────────────────────────────────
-
-MAX_RETRIEVAL_ATTEMPTS = 3
 
 def route_query(state: RAGState) -> str:
     return state["route"]
 
 
 def agent_routing(state: RAGState) -> str:
-    # Always execute pending tool calls first — shortcutting here would leave
-    # an AIMessage with tool_calls unmatched by ToolMessages in the checkpointer,
-    # corrupting history for all future turns in the same session.
     tc = tools_condition(state)
     if tc == "tools":
         return "retrieval"
@@ -382,7 +398,7 @@ def agent_routing(state: RAGState) -> str:
 def after_relevancy_routing(state: RAGState) -> str:
     if state.get("is_relevant", False):
         return "generate_answer"
-    if state.get("rewrite_count", 0) < 1:
+    if state.get("rewrite_count", 0) < 3:
         return "query_rewrite"
     return "generate_answer"
 
@@ -434,4 +450,3 @@ def build_graph(db_path: str = "checkpoints.db"):
     graph.add_edge("generate_answer", END)
 
     return graph.compile(checkpointer=checkpointer)
-
