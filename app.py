@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import uuid
 from datetime import datetime
@@ -6,14 +7,23 @@ from pathlib import Path
 
 import streamlit as st
 from langchain_core.messages import HumanMessage
-from langchain_openai import ChatOpenAI
 
 from backend.btw_handler import handle_btw
+from backend.config import (
+    SUPPORTED_EMBEDDING_MODELS,
+    SUPPORTED_LLM_MODELS,
+    get_embedding_model,
+    get_llm_model,
+    load_user_profile,
+    read_env,
+    save_user_profile,
+    write_env,
+)
 from backend.paper_loader import load_arxiv, load_document, load_webpage
-from backend.rag_graph import build_graph
+from backend.rag_graph import build_graph, get_llm
 from backend.vector_store import add_paper, list_papers
 
-st.set_page_config(page_title="Papeer", page_icon="📚", layout="centered")
+st.set_page_config(page_title="Papeer — Research Assistant", page_icon="📚", layout="centered")
 
 
 @st.cache_resource
@@ -22,7 +32,6 @@ def get_graph():
 
 
 SESSIONS_FILE = Path("sessions.json")
-_rename_llm = ChatOpenAI(model="gpt-5-mini")
 
 
 def load_sessions() -> dict:
@@ -63,7 +72,8 @@ def _serialize_state(values: dict) -> dict:
 
 def generate_session_name(first_message: str) -> str:
     try:
-        response = _rename_llm.invoke(
+        llm = get_llm()
+        response = llm.invoke(
             [
                 {
                     "role": "system",
@@ -136,7 +146,7 @@ def switch_session(session_id: str) -> None:
 
 graph = get_graph()
 
-# ── Bootstrap ──────────────────────────────────────────────────────────────────
+# ── Bootstrap State ────────────────────────────────────────────────────────────
 if "sessions_meta" not in st.session_state:
     st.session_state.sessions_meta = load_sessions()
 if "chats" not in st.session_state:
@@ -154,15 +164,118 @@ if "active_session_id" not in st.session_state:
         sid = create_session()
         st.session_state.active_session_id = sid
 
+if "user_profile" not in st.session_state:
+    st.session_state.user_profile = load_user_profile()
+
 active_sid = st.session_state.active_session_id
+env_dict = read_env()
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    if st.button("+ New Chat", use_container_width=True):
+    profile = st.session_state.user_profile
+    st.markdown(
+        f"### {profile.get('avatar', '🎓')} {profile.get('name', 'Researcher')}\n"
+        f"*{profile.get('role', 'Academic Researcher')}*"
+    )
+
+    # ── User Profile & API Settings Expander ───────────────────────────────────
+    with st.expander("⚙️ Profile & API Settings", expanded=False):
+        st.markdown("#### 👤 User Profile")
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            new_avatar = st.selectbox(
+                "Avatar",
+                ["🎓", "🔬", "🧠", "📚", "🤖", "💻", "💡", "🚀"],
+                index=["🎓", "🔬", "🧠", "📚", "🤖", "💻", "💡", "🚀"].index(profile.get("avatar", "🎓"))
+                if profile.get("avatar", "🎓") in ["🎓", "🔬", "🧠", "📚", "🤖", "💻", "💡", "🚀"]
+                else 0,
+            )
+        with col2:
+            new_name = st.text_input("Name", value=profile.get("name", "Researcher"))
+
+        new_role = st.text_input("Role / Department", value=profile.get("role", "Academic Researcher"))
+        new_focus = st.text_input("Research Focus", value=profile.get("focus_area", "Machine Learning & AI"))
+
+        st.divider()
+        st.markdown("#### 🔑 Model Selection & API Keys")
+        st.caption("Provide your own API keys to directly control costs.")
+
+        current_llm = env_dict.get("OPENAI_MODEL", get_llm_model())
+        llm_idx = SUPPORTED_LLM_MODELS.index(current_llm) if current_llm in SUPPORTED_LLM_MODELS else 0
+        selected_llm = st.selectbox(
+            "🧠 LLM Model",
+            options=SUPPORTED_LLM_MODELS,
+            index=llm_idx,
+            help="Select the OpenAI LLM used for routing, synthesis, and fact-checking.",
+        )
+
+        current_embed = env_dict.get("EMBEDDING_MODEL", get_embedding_model())
+        embed_keys = list(SUPPORTED_EMBEDDING_MODELS.keys())
+        embed_idx = embed_keys.index(current_embed) if current_embed in embed_keys else 0
+        selected_embed = st.selectbox(
+            "📐 Embedding Model",
+            options=embed_keys,
+            index=embed_idx,
+            help="Select the embedding model used for vector representations.",
+        )
+
+        openai_key_input = st.text_input(
+            "OpenAI API Key",
+            value=env_dict.get("OPENAI_API_KEY", ""),
+            type="password",
+            placeholder="sk-...",
+        )
+        tavily_key_input = st.text_input(
+            "Tavily API Key (for web & claims)",
+            value=env_dict.get("TAVILY_API_KEY", ""),
+            type="password",
+            placeholder="tvly-...",
+        )
+        qdrant_url_input = st.text_input(
+            "Qdrant URL",
+            value=env_dict.get("QDRANT_URL", ""),
+            placeholder="https://...cloud.qdrant.io",
+        )
+        qdrant_key_input = st.text_input(
+            "Qdrant API Key",
+            value=env_dict.get("QDRANT_API_KEY", ""),
+            type="password",
+            placeholder="ey...",
+        )
+
+        if st.button("💾 Save Profile & Keys", use_container_width=True, type="primary"):
+            # Update Profile
+            updated_profile = {
+                "name": new_name.strip() or "Researcher",
+                "avatar": new_avatar,
+                "role": new_role.strip(),
+                "focus_area": new_focus.strip(),
+            }
+            save_user_profile(updated_profile)
+            st.session_state.user_profile = updated_profile
+
+            # Update .env
+            env_updates = {
+                "OPENAI_API_KEY": openai_key_input.strip(),
+                "OPENAI_MODEL": selected_llm,
+                "EMBEDDING_MODEL": selected_embed,
+                "TAVILY_API_KEY": tavily_key_input.strip(),
+                "QDRANT_URL": qdrant_url_input.strip(),
+                "QDRANT_API_KEY": qdrant_key_input.strip(),
+            }
+            write_env(env_updates)
+            st.cache_resource.clear()
+            st.success("✅ Profile and settings saved successfully!")
+            st.rerun()
+
+    st.divider()
+
+    if st.button("➕ New Chat", use_container_width=True):
         new_sid = create_session()
         st.session_state.active_session_id = new_sid
         active_sid = new_sid
         st.rerun()
+
     st.divider()
     st.markdown("## 💬 Sessions")
 
@@ -282,21 +395,30 @@ with st.sidebar:
     except Exception:
         doc_titles = None
     if doc_titles is None:
-        st.caption("Could not load document list — try refreshing.")
+        st.caption("Could not load document list — verify Qdrant credentials.")
     elif doc_titles:
         for title in doc_titles:
             st.markdown(f"- {title}")
     else:
         st.caption("No documents loaded yet.")
 
-# ── Page header ────────────────────────────────────────────────────────────────
-st.title("📚 Papeer — Research Paper Assistant")
+# ── Main Page Header ───────────────────────────────────────────────────────────
+st.title("📚 Papeer — Research Assistant")
 st.markdown(
-    "🔍 **Ask questions** from your uploaded papers &nbsp;·&nbsp; "
-    "✅ **Verify claims** against recent literature &nbsp;·&nbsp; "
-    "🌐 **Search the web** for the latest findings\n\n"
-    "> Upload documents in the sidebar and start chatting below."
+    f"Active Model: `{get_llm_model()}` &nbsp;|&nbsp; "
+    f"Embeddings: `{get_embedding_model()}`\n\n"
+    "🔍 **Ask questions** from papers &nbsp;·&nbsp; "
+    "✅ **Verify claims** against newer work &nbsp;·&nbsp; "
+    "🌐 **Live search** with Tavily"
 )
+
+# API Key alert if missing
+if not os.environ.get("OPENAI_API_KEY"):
+    st.warning(
+        "⚠️ **OpenAI API Key not set.** Please open **⚙️ Profile & API Settings** in the sidebar "
+        "to enter your OpenAI API key and choose your preferred model."
+    )
+
 st.divider()
 
 # ── Chat display ───────────────────────────────────────────────────────────────
@@ -304,11 +426,11 @@ for msg in st.session_state.chats.get(active_sid, []):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg["role"] == "assistant":
-            with st.expander(f"📊 Graph state · turn {msg['turn']}", expanded=False):
-                st.json(msg["graph_state"])
+            with st.expander(f"📊 Graph state · turn {msg.get('turn', 1)}", expanded=False):
+                st.json(msg.get("graph_state", {}))
 
 # ── Chat input ─────────────────────────────────────────────────────────────────
-if prompt := st.chat_input("Ask about your papers, verify a claim, or search the web…"):
+if prompt := st.chat_input("Ask about your papers, verify a claim, or type /btw for side questions…"):
     is_btw = prompt.strip().lower().startswith("/btw")
 
     if is_btw:
@@ -324,10 +446,13 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
             else:
                 placeholder = st.empty()
                 response_text = ""
-                for chunk in handle_btw(query):
-                    response_text += chunk
-                    placeholder.markdown(response_text + "▌")
-                placeholder.markdown(response_text)
+                try:
+                    for chunk in handle_btw(query):
+                        response_text += chunk
+                        placeholder.markdown(response_text + "▌")
+                    placeholder.markdown(response_text)
+                except Exception as e:
+                    placeholder.error(f"Error handling /btw request: {e}")
             st.caption("Side channel — not saved to session history.")
 
     else:
@@ -367,22 +492,26 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
             placeholder = st.empty()
             response_text = ""
 
-            for chunk, metadata in graph.stream(input_state, config, stream_mode="messages"):
-                if (
-                    metadata.get("langgraph_node") == "generate_answer"
-                    and hasattr(chunk, "content")
-                    and chunk.content
-                ):
-                    response_text += chunk.content
-                    placeholder.markdown(response_text + "▌")
+            try:
+                for chunk, metadata in graph.stream(input_state, config, stream_mode="messages"):
+                    if (
+                        metadata.get("langgraph_node") == "generate_answer"
+                        and hasattr(chunk, "content")
+                        and chunk.content
+                    ):
+                        response_text += chunk.content
+                        placeholder.markdown(response_text + "▌")
 
-            if not response_text:
-                final_values = graph.get_state(config).values
-                response_text = final_values.get("answer") or "No response generated."
+                if not response_text:
+                    final_values = graph.get_state(config).values
+                    response_text = final_values.get("answer") or "No response generated."
 
-            placeholder.markdown(response_text)
+                placeholder.markdown(response_text)
+            except Exception as e:
+                response_text = f"⚠️ An error occurred while generating the response: {e}"
+                placeholder.error(response_text)
 
-            final_values = graph.get_state(config).values
+            final_values = graph.get_state(config).values if graph.get_state(config) else {}
             state_snapshot = _serialize_state(final_values)
 
             with st.expander(f"📊 Graph state · turn {current_turn}", expanded=False):
