@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: papeer-research-assistant
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: EMBEDDING_MODEL
+        value: text-embedding-3-small
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: QDRANT_URL
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    healthCheckPath: /_stcore/health
